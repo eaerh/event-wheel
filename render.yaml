@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: event-wheel
+    runtime: python
+    rootDir: backend
+    pythonVersion: "3.11"
+    buildCommand: pip install -r requirements-cloud.txt && cd ../frontend && npm ci && npm run build
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # paste your Neon connection string in the Render dashboard
