@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Event } from '../api';
+import { Event, getEventIcsUrl, getEventIcsShareUrl, getGoogleCalendarUrl } from '../api';
 
 interface WinnerModalProps {
   event: Event;
@@ -8,6 +8,7 @@ interface WinnerModalProps {
 
 export function WinnerModal({ event, onClose }: WinnerModalProps) {
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -28,6 +29,16 @@ export function WinnerModal({ event, onClose }: WinnerModalProps) {
       return dateStr + ' at ' + date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     }
     return dateStr;
+  };
+
+  const handleCopyInviteLink = async () => {
+    try {
+      await navigator.clipboard.writeText(getEventIcsShareUrl(event.id));
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 2000);
+    } catch {
+      // Fallback
+    }
   };
 
   const handleShare = async () => {
@@ -83,6 +94,21 @@ export function WinnerModal({ event, onClose }: WinnerModalProps) {
               {copied ? '✓ Copied!' : '📤 Share'}
             </button>
             <button onClick={onClose} className="modal-btn-ghost">Spin Again</button>
+          </div>
+
+          <div className="modal-calendar">
+            <span className="modal-calendar-label">Add to calendar</span>
+            <div className="modal-calendar-actions">
+              <a href={getEventIcsUrl(event.id)} download className="modal-btn-ghost">
+                📅 Download .ics
+              </a>
+              <a href={getGoogleCalendarUrl(event)} target="_blank" rel="noopener noreferrer" className="modal-btn-ghost">
+                Google Calendar ↗
+              </a>
+              <button onClick={handleCopyInviteLink} className="modal-btn-ghost">
+                {linkCopied ? '✓ Link copied!' : '🔗 Copy invite link'}
+              </button>
+            </div>
           </div>
         </div>
       </div>

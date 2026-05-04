@@ -6,6 +6,14 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Load .env if present (exports DATABASE_URL, PUBLIC_URL, etc.)
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 echo "🔨 Building frontend..."
 cd frontend && npm run build --silent && cd ..
 
@@ -41,10 +49,10 @@ for i in $(seq 1 15); do
 done
 rm -f "$TUNNEL_LOG"
 
-# Tell the backend the public URL so the frontend can use it for share links
-if [ -n "$TUNNEL_URL" ]; then
-    export PUBLIC_URL="$TUNNEL_URL"
-    # Restart backend with the env var set
+# Tell the backend the public URL so the frontend can use it for share links.
+# Only use the tunnel URL if PUBLIC_URL is not already set (e.g. via .env).
+if [ -n "$TUNNEL_URL" ] && [ -z "$PUBLIC_URL" ]; then
+    # Restart backend with the tunnel URL set
     kill $BACKEND_PID 2>/dev/null
     sleep 1
     cd backend

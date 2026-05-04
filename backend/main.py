@@ -4,13 +4,13 @@ import json
 import os
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from rapidfuzz import fuzz
 from sqlalchemy import func
@@ -348,6 +348,66 @@ def delete_event(event_id: int, db: Session = Depends(get_db)):
     db.delete(event)
     db.commit()
     return {"message": "Event deleted", "id": event_id}
+
+
+@app.get("/events/{event_id}/ics")
+def get_event_ics(event_id: int, db: Session = Depends(get_db)):
+    """Download a calendar invite (.ics) for an event."""
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    def esc(text: str) -> str:
+        """Escape special characters for ICS text fields."""
+        return text.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n').replace('\r', '')
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Event Wheel//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:event-{event.id}@event-wheel",
+        f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+    ]
+
+    if event.date:
+        has_time = event.date.hour != 0 or event.date.minute != 0
+        if has_time:
+            lines.append(f"DTSTART:{event.date.strftime('%Y%m%dT%H%M%S')}")
+            lines.append(f"DTEND:{(event.date + timedelta(hours=2)).strftime('%Y%m%dT%H%M%S')}")
+        else:
+            lines.append(f"DTSTART;VALUE=DATE:{event.date.strftime('%Y%m%d')}")
+            lines.append(f"DTEND;VALUE=DATE:{(event.date + timedelta(days=1)).strftime('%Y%m%d')}")
+
+    lines.append(f"SUMMARY:{esc(event.title)}")
+
+    if event.location:
+        lines.append(f"LOCATION:{esc(event.location)}")
+
+    desc_parts = []
+    if event.description:
+        desc_parts.append(event.description)
+    if event.url:
+        desc_parts.append(event.url)
+    if desc_parts:
+        lines.append(f"DESCRIPTION:{esc(' '.join(desc_parts))}")
+
+    if event.url:
+        lines.append(f"URL:{event.url}")
+
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+
+    content = "\r\n".join(lines) + "\r\n"
+    safe_title = re.sub(r'[^\w\s-]', '', event.title)[:50].strip().replace(' ', '_')
+    filename = f"{safe_title}.ics" if safe_title else "event.ics"
+
+    return Response(
+        content=content,
+        media_type="text/calendar",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/events")

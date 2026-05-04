@@ -128,6 +128,37 @@ export async function enrichEvents(): Promise<{ enriched: number }> {
   return res.json();
 }
 
+export function getEventIcsUrl(eventId: number): string {
+  return `${API_BASE}/events/${eventId}/ics`;
+}
+
+export function getEventIcsShareUrl(eventId: number): string {
+  return `${window.location.origin}/events/${eventId}/ics`;
+}
+
+export function getGoogleCalendarUrl(event: Event): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const params = new URLSearchParams({ action: 'TEMPLATE', text: event.title });
+  if (event.date) {
+    const d = new Date(event.date);
+    const hasTime = d.getHours() !== 0 || d.getMinutes() !== 0;
+    if (hasTime) {
+      const fmt = (dt: Date) =>
+        `${dt.getFullYear()}${pad(dt.getMonth() + 1)}${pad(dt.getDate())}T${pad(dt.getHours())}${pad(dt.getMinutes())}00`;
+      const end = new Date(d.getTime() + 2 * 60 * 60 * 1000);
+      params.set('dates', `${fmt(d)}/${fmt(end)}`);
+    } else {
+      const fmt = (dt: Date) => `${dt.getFullYear()}${pad(dt.getMonth() + 1)}${pad(dt.getDate())}`;
+      const next = new Date(d.getTime() + 24 * 60 * 60 * 1000);
+      params.set('dates', `${fmt(d)}/${fmt(next)}`);
+    }
+  }
+  if (event.location) params.set('location', event.location);
+  const details = [event.description, event.url].filter(Boolean).join('\n');
+  if (details) params.set('details', details);
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
 export function getExportUrl(filters: Filters, format: 'csv' | 'text' = 'csv'): string {
   const params = new URLSearchParams();
   if (filters.from) params.set('from', filters.from);
