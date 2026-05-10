@@ -8,6 +8,7 @@ import { SpinWheel, WeightedEvent } from './components/SpinWheel';
 import { WinnerModal } from './components/WinnerModal';
 import { DatePoll } from './components/DatePoll';
 import { ToastContainer, Toast, createToast } from './components/Toast';
+import { BouncingHeads } from './components/Friendship';
 import './App.css';
 
 // ── Helpers ──
@@ -319,6 +320,7 @@ function App() {
       {!isDirectPollLink && (
         <header>
           <h1>🎡 Event Wheel</h1>
+          <BouncingHeads />
           <nav className="app-nav">
             <button
               className={`nav-tab ${!isPoll ? 'active' : ''}`}
