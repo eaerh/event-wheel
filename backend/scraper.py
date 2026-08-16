@@ -224,6 +224,12 @@ class VisitOsloScraper(BaseScraper):
     """
     Scrapes events from visitoslo.com.
 
+    The events grid is a Craft CMS Sprig (htmx) component paginated 12/page.
+    Cloudflare blocks pagination XHRs from headless browsers, so this runs
+    headed. URL params for date/category are ignored server-side — the
+    scraper walks pages until it passes the requested to_date, then filters
+    client-side.
+
     Requires Playwright with Chromium installed:
         uv run playwright install chromium
     """
@@ -231,42 +237,18 @@ class VisitOsloScraper(BaseScraper):
     name = "visitoslo"
     base_url = "https://www.visitoslo.com/en/whats-on/events/"
 
-    # Known visitoslo category keywords
-    CATEGORIES = {
-        "concert", "festival", "theatre", "exhibition", "sport",
-        "annual events", "major events", "classical concerts",
-        "rock/pop", "folk music", "jazz", "electronic", "hip-hop",
-        "dance", "opera", "comedy", "family", "outdoor", "food",
-        "market", "film", "art", "children", "nightlife",
-        "show", "stand-up", "standup", "quiz", "workshop", "talk", "music",
-        "guided tour", "lecture", "performance", "party",
-        "musical", "english event", "sacred",
-        # Genre/style categories
-        "country", "ballet", "choir", "club", "hip hop",
-        "hard rock/metal", "skiing", "jazz concerts",
-        "r&b", "soul", "blues", "world music", "pop",
-        "rock", "metal", "punk", "reggae", "latin",
+    # Month abbreviations from the date wedge — visitoslo uses English on /en/
+    # but includes Norwegian variants (mai/okt/des) as a safety net.
+    MONTH_ABBR = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "mai": 5, "okt": 10, "des": 12,
     }
 
-    # All category IDs used by visitoslo.com event calendar
-    CATEGORY_IDS = (
-        "505552,506042,507212,507232,505772,506922,506802,519862,"
-        "506032,513572,506232,505792,500602,508172,508182,502032,"
-        "507222,509172"
-    )
-
-    def _build_url(self, from_date: Optional[str] = None, to_date: Optional[str] = None) -> str:
-        """Build URL with all required params (CategoryIds + offset + dates)."""
-        url = self.base_url
-        params = [
-            f"CategoryIds={self.CATEGORY_IDS}",
-            "offset=0",
-        ]
-        if from_date:
-            params.append(f"FromDate={from_date}")
-        if to_date:
-            params.append(f"ToDate={to_date}")
-        return url + "?" + "&".join(params)
+    # Safety cap so we can't loop forever if pagination breaks
+    MAX_PAGES = 60
+    # Cap detail-page enrichment to keep scrape latency bounded
+    MAX_DETAIL_ENRICH = 40
 
     def _create_browser(self, headless: bool = True):
         """Create a Playwright browser + context configured to bypass Cloudflare."""
@@ -319,291 +301,191 @@ class VisitOsloScraper(BaseScraper):
         except Exception:
             pass
 
-    def _load_listing(self, page, target_url: str) -> str:
-        """Load listing page, scroll to load all events, return HTML."""
-        page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-
-        # Dismiss cookie banner (blocks interactions if present)
-        page.wait_for_timeout(2000)
+    def _load_first_page(self, page) -> None:
+        """Load the events listing base URL and wait for cards to render."""
+        page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
         self._dismiss_cookie_banner(page)
+        try:
+            page.wait_for_selector(
+                "article.content-card[data-variant='event']", timeout=15000
+            )
+        except Exception:
+            pass
 
-        for _ in range(30):
-            page.wait_for_timeout(1000)
-            if page.locator('a[href*="/whats-on/events/?tlp="]').count() > 0:
-                break
+    def _first_card_title(self, page) -> str:
+        try:
+            first = page.locator("article.content-card[data-variant='event'] h3").first
+            if first.count() > 0:
+                return first.inner_text(timeout=1000).strip()
+        except Exception:
+            pass
+        return ""
 
-        # Scroll to load all lazy/infinite-scroll events
-        prev_count = 0
-        stale_rounds = 0
+    def _click_next_page(self, page, target_page: int) -> bool:
+        """Trigger htmx navigation to `target_page`. Returns True if the DOM swapped."""
+        before = self._first_card_title(page)
+
+        # Find and click the pagination anchor whose data-hx-vals references page=N.
+        # Using htmx.trigger ensures the swap happens (a bare click bubbles through
+        # the parent's hx-trigger="refresh" without hitting the intended handler).
+        script = (
+            "() => {"
+            "  const marker = '\"page\":\"' + %d + '\"';"
+            "  const a = Array.from(document.querySelectorAll('a[data-hx-vals]'))"
+            "    .find(el => (el.getAttribute('data-hx-vals')||'').includes(marker));"
+            "  if (!a) return 'not-found';"
+            "  if (typeof htmx !== 'undefined' && htmx.trigger) {"
+            "    htmx.trigger(a, 'click');"
+            "    return 'triggered';"
+            "  }"
+            "  a.click();"
+            "  return 'clicked';"
+            "}"
+        ) % target_page
+        result = page.evaluate(script)
+        if result == "not-found":
+            return False
+
+        # Wait for the swap: the first card's title changes.
         for _ in range(20):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-            for btn_text in ["Show more", "Load more", "Vis flere", "See more"]:
-                btn = page.locator(f'button:has-text("{btn_text}")').first
-                if btn.count() > 0 and btn.is_visible():
-                    try:
-                        btn.click()
-                        page.wait_for_timeout(2000)
-                    except Exception:
-                        pass
-            cur_count = page.locator('a[href*="/whats-on/events/?tlp="]').count()
-            if cur_count == prev_count:
-                stale_rounds += 1
-                if stale_rounds >= 2:
-                    break
-            else:
-                stale_rounds = 0
-            prev_count = cur_count
+            page.wait_for_timeout(300)
+            now_title = self._first_card_title(page)
+            if now_title and now_title != before:
+                page.wait_for_timeout(500)  # settle
+                return True
+        return False
 
-        return page.content()
+    def _parse_month_day(self, day_str: str, month_str: str) -> Optional[datetime]:
+        """Turn '17' + 'aug' into a datetime, guessing the year."""
+        day_digits = re.sub(r"\D", "", day_str or "")
+        try:
+            day = int(day_digits)
+        except ValueError:
+            return None
+        month = self.MONTH_ABBR.get((month_str or "").strip().lower()[:3])
+        if not month:
+            return None
+        now = datetime.now()
+        try:
+            candidate = datetime(now.year, month, day)
+        except ValueError:
+            return None
+        # Wrap to next year if the wedge points to a clearly-past date
+        if (now - candidate).days > 60:
+            try:
+                candidate = datetime(now.year + 1, month, day)
+            except ValueError:
+                return None
+        return candidate
 
-    def _parse_listing(self, html: str) -> list[ScrapedEvent]:
-        """Parse event links from listing HTML, deduped by tlp= ID."""
+    def _parse_page(self, html: str) -> list[ScrapedEvent]:
+        """Parse all event cards on the current listing page."""
         soup = BeautifulSoup(html, "lxml")
 
-        title_el = soup.find("title")
-        page_title = title_el.get_text(strip=True) if title_el else ""
+        page_title = soup.title.get_text(strip=True) if soup.title else ""
         if "just a moment" in page_title.lower() or "security" in page_title.lower():
             raise RuntimeError(
                 "Cloudflare challenge was not solved. "
-                "Try again — the browser needs to be visible to pass the check."
+                "The browser must be visible to pass the check."
             )
-
-        links = soup.find_all(
-            "a", href=lambda h: h and "/whats-on/events/?tlp=" in str(h)
-        )
-
-        # Group links by tlp= ID to dedup duplicate <a> tags for the same event
-        by_tlp: dict[str, list] = {}
-        for link in links:
-            href = link.get("href", "")
-            tlp_match = re.search(r"tlp=(\w+)", href)
-            tlp_id = tlp_match.group(1) if tlp_match else href
-            by_tlp.setdefault(tlp_id, []).append(link)
 
         events: list[ScrapedEvent] = []
-        now = datetime.now()
-        current_year = now.year
-
-        for tlp_id, link_group in by_tlp.items():
-            # Parse each <a> variant and pick the best one
-            best = self._parse_single_link(link_group[0], now, current_year)
-            for link in link_group[1:]:
-                alt = self._parse_single_link(link, now, current_year)
-                if alt and (not best or self._event_richness(alt) > self._event_richness(best)):
-                    best = alt
-            if best:
-                events.append(best)
-
+        for card in soup.select("article.content-card[data-variant='event']"):
+            ev = self._parse_card(card)
+            if ev:
+                events.append(ev)
         return events
 
-    @staticmethod
-    def _event_richness(ev: ScrapedEvent) -> int:
-        """Score how much data an event has (higher = richer)."""
-        score = 0
-        if ev.title:
-            score += 3
-            # Penalize category-word titles (e.g., "country", "concert")
-            if ev.title.lower() in VisitOsloScraper.CATEGORIES:
-                score -= 2
-        if ev.date:
-            score += 2
-            if ev.date.hour != 0 or ev.date.minute != 0:
-                score += 1
-        if ev.location:
-            score += 1
-        if ev.description:
-            score += 1
-        if ev.image_url:
-            score += 1
-        if ev.category:
-            score += 1
-        return score
+    def _parse_card(self, card) -> Optional[ScrapedEvent]:
+        """Parse a single content-card article into a ScrapedEvent."""
+        # URL — first <a> pointing at /event/<slug>
+        link = card.find(
+            "a", href=lambda h: h and "visitoslo.com/event/" in str(h)
+        )
+        url = link.get("href") if link else None
 
-    def _parse_single_link(self, link, now, current_year) -> Optional[ScrapedEvent]:
-        """Parse a single <a> tag into a ScrapedEvent."""
-        href = link.get("href", "")
-        url = f"https://www.visitoslo.com{href}" if href.startswith("/") else href
-
-        img_tag = link.find("img")
-        image_url = img_tag.get("src") if img_tag else None
-
-        parts = [p.strip() for p in link.get_text(separator="|", strip=True).split("|")]
-
-        offset = 0
-        if parts and parts[0].lower().startswith("photo"):
-            offset = 2
-        elif parts and not parts[0].isdigit():
-            for j, p in enumerate(parts):
-                if p.isdigit():
-                    offset = j
-                    break
-
-        if offset + 2 >= len(parts):
-            name_match = re.search(r"name=([^&]+)", href)
-            if name_match:
-                return ScrapedEvent(
-                    title=name_match.group(1).replace("-", " "),
-                    source=self.name,
-                    url=url,
-                    image_url=image_url,
-                )
-            return None
-
-        day_str = parts[offset]
-        month_str = parts[offset + 1]
-
-        title = None
-        description = None
-        event_categories: list[str] = []
-        for i, part in enumerate(parts[offset + 2:], start=offset + 2):
-            if part.lower() in self.CATEGORIES:
-                event_categories.append(part.lower())
-            else:
-                title = part
-                if i + 1 < len(parts):
-                    description = " ".join(parts[i + 1:])
-                break
-
-        # Guard: if title ended up as a category word, prefer the URL name= param
-        if title and title.lower() in self.CATEGORIES:
-            event_categories.append(title.lower())
-            name_match = re.search(r"name=([^&]+)", href)
-            if name_match:
-                title = name_match.group(1).replace("-", " ")
-            # else keep the category-word title as last resort
-
-        if not title:
-            name_match = re.search(r"name=([^&]+)", href)
-            title = name_match.group(1).replace("-", " ") if name_match else None
-
+        # Title — <h3> inside the card body
+        h3 = card.find("h3")
+        title = h3.get_text(strip=True) if h3 else None
         if not title:
             return None
 
-        # Deduplicate categories
-        category_str = ", ".join(sorted(set(event_categories))) if event_categories else None
-
+        # Date wedge — <p class="font-heading"> with day & month spans
         event_date = None
-        try:
-            event_date = dateparser.parse(
-                f"{day_str} {month_str} {current_year}", fuzzy=True
-            )
-            if event_date and (now - event_date).days > 60:
-                event_date = event_date.replace(year=current_year + 1)
-        except (ValueError, TypeError):
-            pass
+        wedge = card.select_one("p.font-heading")
+        if wedge:
+            spans = wedge.find_all("span")
+            if len(spans) >= 2:
+                event_date = self._parse_month_day(
+                    spans[0].get_text(strip=True),
+                    spans[1].get_text(strip=True),
+                )
+
+        # Category pills. First pill == 'Ad' marks a sponsored slot; skip it.
+        pills: list[str] = []
+        for pill in card.select("span.content-card__pill span.caption"):
+            txt = pill.get_text(strip=True)
+            if txt:
+                pills.append(txt)
+        if pills and pills[0].lower() == "ad":
+            return None
+        category_str = ", ".join(pills) if pills else None
+
+        # Icon rows for time & location. Icon <img src> tells them apart.
+        time_str = None
+        location = None
+        for li in card.select("ul li"):
+            img = li.find("img")
+            src = (img.get("src", "") if img else "").lower()
+            span = li.select_one("span.caption")
+            text = span.get_text(strip=True) if span else ""
+            if not text:
+                continue
+            if "time" in src:
+                time_str = text
+            elif "location" in src:
+                location = text
+
+        if event_date and time_str:
+            m = re.match(r"^(\d{1,2})[:.](\d{2})", time_str)
+            if m:
+                event_date = event_date.replace(
+                    hour=int(m.group(1)), minute=int(m.group(2))
+                )
+
+        # Image — first <img> in the card, but ignore the icon svgs
+        image_url = None
+        media_img = card.select_one(".content-card__media img")
+        if media_img:
+            image_url = media_img.get("src")
 
         return ScrapedEvent(
             title=title,
             source=self.name,
             date=event_date,
+            location=location,
             url=url,
-            description=description,
             image_url=image_url,
             category=category_str,
         )
 
-    def _scrape_detail_page(self, page, event: ScrapedEvent, target_date: Optional[str], is_first: bool = False) -> None:
-        """Visit an event's detail page and enrich it with time/description data."""
-        import json as _json
-
-        if not event.url:
+    def _scrape_detail_page(self, page, event: ScrapedEvent) -> None:
+        """Enrich a ScrapedEvent from its detail page (description only)."""
+        if not event.url or event.description:
             return
-
         try:
             page.goto(event.url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1500)
-            # Dismiss cookie banner on first detail page visit
-            if is_first:
-                self._dismiss_cookie_banner(page)
-                page.wait_for_timeout(1000)
+            page.wait_for_timeout(800)
             html = page.content()
         except Exception:
             return
-
-        # Extract the React ProductPresentationPage JSON
-        match = re.search(r"ProductPresentationPage,\s*(\{.*?\})\)\)", html)
-        if not match:
-            return
-
-        try:
-            data = _json.loads(match.group(1))
-        except _json.JSONDecodeError:
-            return
-
-        prod = data.get("product", data)
-
-        # Extract description
-        desc = prod.get("description", "")
-        if isinstance(desc, str) and desc and not event.description:
-            event.description = desc[:300]
-
-        # Extract venue from openingLocation (actual venue name, not city)
-        venue = prod.get("openingLocation", "")
-        if venue:
-            event.location = venue
-        else:
-            # Fallback: try address street
-            addr = prod.get("address", {})
-            if isinstance(addr, dict):
-                street = addr.get("street", "")
-                if street:
-                    event.location = street
-
-        # Extract image if not already set
-        images = prod.get("images", [])
-        if isinstance(images, list) and images and not event.image_url:
-            event.image_url = images[0].get("url")
-
-        # Extract time from eventItems matching the target date
-        event_items = prod.get("eventItems", []) or []
-        if not isinstance(event_items, list):
-            return
-
-        for item in event_items:
-            if not isinstance(item, dict):
-                continue
-            from_time = item.get("fromTime")
-            if not from_time:
-                continue
-
-            # If we have a target date, match only eventItems for that date
-            if target_date:
-                item_from = item.get("fromDate", "")
-                if isinstance(item_from, str) and target_date in item_from:
-                    try:
-                        dt = datetime.fromisoformat(from_time.replace("Z", ""))
-                        if event.date:
-                            event.date = event.date.replace(hour=dt.hour, minute=dt.minute)
-                        else:
-                            event.date = dt
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            else:
-                # No target date — use the first eventItem with a time
-                try:
-                    dt = datetime.fromisoformat(from_time.replace("Z", ""))
-                    if event.date:
-                        event.date = event.date.replace(hour=dt.hour, minute=dt.minute)
-                    else:
-                        event.date = dt
-                except (ValueError, TypeError):
-                    pass
-                break
-
-    def _enrich_with_details(self, events: list[ScrapedEvent], target_date: Optional[str]) -> None:
-        """Visit detail pages in a headed browser to extract times and descriptions."""
-        # Detail pages need headed mode (cookie consent + JS routing)
-        pw, browser, ctx = self._create_browser(headless=False)
-        try:
-            page = self._new_page(ctx)
-            for i, event in enumerate(events):
-                self._scrape_detail_page(page, event, target_date, is_first=(i == 0))
-            page.close()
-        finally:
-            browser.close()
-            pw.stop()
+        soup = BeautifulSoup(html, "lxml")
+        meta = soup.find("meta", attrs={"name": "description"})
+        if meta and meta.get("content"):
+            desc = meta["content"].strip()
+            if desc:
+                event.description = desc[:300]
 
     def scrape(self, from_date: Optional[str] = None, to_date: Optional[str] = None) -> list[ScrapedEvent]:
         try:
@@ -616,60 +498,79 @@ class VisitOsloScraper(BaseScraper):
 
         from datetime import timedelta
 
-        today = datetime.now()
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Use headless for listing (invisible, fast)
-        pw, browser, ctx = self._create_browser(headless=True)
+        fd_date = None
+        td_date = None
+        if from_date:
+            try:
+                fd_date = datetime.fromisoformat(from_date).date()
+            except (ValueError, TypeError):
+                fd_date = None
+        if to_date:
+            try:
+                td_date = datetime.fromisoformat(to_date).date()
+            except (ValueError, TypeError):
+                td_date = None
+        if not td_date:
+            td_date = (today + timedelta(days=30)).date()
+
+        # Cloudflare blocks the paginated Sprig XHR from headless browsers,
+        # so this scraper runs headed for the whole session.
+        pw, browser, ctx = self._create_browser(headless=False)
+        events: list[ScrapedEvent] = []
+        seen_keys: set[str] = set()
 
         try:
-            if from_date and to_date:
-                url = self._build_url(from_date, to_date)
-                page = self._new_page(ctx)
-                html = self._load_listing(page, url)
-                page.close()
-                events = self._parse_listing(html)
-                if not events:
-                    raise RuntimeError(
-                        f"No events found on visitoslo.com for {from_date} to {to_date}"
-                    )
-            else:
-                # Default: load multiple windows covering ~30 days
-                events = []
-                seen_titles: set[str] = set()
+            page = self._new_page(ctx)
+            self._load_first_page(page)
 
-                windows = [
-                    (today.strftime("%Y-%m-%d"), (today + timedelta(days=7)).strftime("%Y-%m-%d")),
-                    ((today + timedelta(days=7)).strftime("%Y-%m-%d"), (today + timedelta(days=14)).strftime("%Y-%m-%d")),
-                    ((today + timedelta(days=14)).strftime("%Y-%m-%d"), (today + timedelta(days=30)).strftime("%Y-%m-%d")),
-                ]
+            passed_end_date = False
+            current_page = 1
+            for _ in range(self.MAX_PAGES):
+                page_events = self._parse_page(page.content())
+                if not page_events:
+                    break
 
-                for from_d, to_d in windows:
-                    url = self._build_url(from_d, to_d)
-                    try:
-                        page = self._new_page(ctx)
-                        html = self._load_listing(page, url)
-                        page.close()
-                        parsed = self._parse_listing(html)
-                        for ev in parsed:
-                            key = ev.title.lower().strip()
-                            if key not in seen_titles:
-                                seen_titles.add(key)
-                                events.append(ev)
-                    except Exception:
+                for ev in page_events:
+                    key = ev.url or ev.title.lower().strip()
+                    if key in seen_keys:
                         continue
+                    seen_keys.add(key)
 
-                if not events:
-                    raise RuntimeError("No events found from visitoslo.com")
+                    if ev.date:
+                        d = ev.date.date()
+                        if fd_date and d < fd_date:
+                            continue
+                        if td_date and d > td_date:
+                            passed_end_date = True
+                            continue
+                    events.append(ev)
+
+                if passed_end_date:
+                    break
+
+                current_page += 1
+                if not self._click_next_page(page, current_page):
+                    break
+
+            # Best-effort detail enrichment (description only)
+            for ev in events[: self.MAX_DETAIL_ENRICH]:
+                try:
+                    self._scrape_detail_page(page, ev)
+                except Exception:
+                    continue
+
+            page.close()
         finally:
             browser.close()
             pw.stop()
 
-        # Enrich with detail pages (separate headed browser)
-        try:
-            self._enrich_with_details(events, from_date)
-        except Exception:
-            pass  # Detail enrichment is optional; listing data is still useful
-
+        if not events:
+            raise RuntimeError(
+                "No events found on visitoslo.com. "
+                "The site structure may have changed again."
+            )
         return events
 
 
