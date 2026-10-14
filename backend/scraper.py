@@ -224,18 +224,20 @@ class VisitOsloScraper(BaseScraper):
     """
     Scrapes events from visitoslo.com.
 
-    The events grid is a Craft CMS Sprig (htmx) component paginated 12/page.
-    Cloudflare blocks pagination XHRs from headless browsers, so this runs
-    headed. URL params for date/category are ignored server-side — the
-    scraper walks pages until it passes the requested to_date, then filters
-    client-side.
+    The events grid is a Craft CMS Sprig (htmx) component paginated 12/page,
+    one card per event occurrence. Cloudflare blocks pagination XHRs from
+    headless browsers, so this runs headed. After the first page load, the
+    scraper calls the Sprig render endpoint directly from inside the page
+    with from/to (dd.mm.yyyy) so the date range is filtered server-side,
+    then fetches every result page.
 
     Requires Playwright with Chromium installed:
         uv run playwright install chromium
     """
 
     name = "visitoslo"
-    base_url = "https://www.visitoslo.com/en/whats-on/events/"
+    # /en/whats-on/events/ now 301s here; content is still English (siteId 2)
+    base_url = "https://www.visitoslo.com/whats-on/events"
 
     # Month abbreviations from the date wedge — visitoslo uses English on /en/
     # but includes Norwegian variants (mai/okt/des) as a safety net.
@@ -245,8 +247,11 @@ class VisitOsloScraper(BaseScraper):
         "mai": 5, "okt": 10, "des": 12,
     }
 
-    # Safety cap so we can't loop forever if pagination breaks
-    MAX_PAGES = 60
+    PAGE_SIZE = 12
+    # Safety cap (~3000 occurrences); a 30-day window is ~110 pages
+    MAX_PAGES = 250
+    # Listing pages fetched in parallel per batch
+    FETCH_CONCURRENCY = 6
     # Cap detail-page enrichment to keep scrape latency bounded
     MAX_DETAIL_ENRICH = 40
 
@@ -313,48 +318,56 @@ class VisitOsloScraper(BaseScraper):
         except Exception:
             pass
 
-    def _first_card_title(self, page) -> str:
-        try:
-            first = page.locator("article.content-card[data-variant='event'] h3").first
-            if first.count() > 0:
-                return first.inner_text(timeout=1000).strip()
-        except Exception:
-            pass
-        return ""
+    # Runs inside the page so the request carries the Cloudflare clearance.
+    # Reuses the signed sprig:config from the rendered component and the base
+    # params (entryId, filter flags) from a pagination link, then fetches the
+    # requested listing pages concurrently.
+    _FETCH_PAGES_JS = """async ({pages, from, to}) => {
+      const comp = document.querySelector('.sprig-component[data-hx-vals]');
+      if (!comp) return {error: 'no-component'};
+      const config = JSON.parse(comp.getAttribute('data-hx-vals'))['sprig:config'];
+      const link = Array.from(document.querySelectorAll('a[data-hx-vals]'))
+        .find(a => (a.getAttribute('data-hx-vals') || '').includes('"page"'));
+      const base = link ? JSON.parse(link.getAttribute('data-hx-vals')) : {};
+      const endpoint = comp.getAttribute('data-hx-get');
+      const results = await Promise.all(pages.map(async (n) => {
+        const params = new URLSearchParams({
+          ...base, category: '', area: '', freeOnly: '0',
+          page: String(n), from, to, 'sprig:config': config,
+        });
+        const r = await fetch(endpoint + '&' + params.toString(), {headers: {'HX-Request': 'true'}});
+        return {page: n, status: r.status, html: r.status === 200 ? await r.text() : ''};
+      }));
+      return {results};
+    }"""
 
-    def _click_next_page(self, page, target_page: int) -> bool:
-        """Trigger htmx navigation to `target_page`. Returns True if the DOM swapped."""
-        before = self._first_card_title(page)
+    def _fetch_listing_pages(self, page, pages: list[int], from_str: str, to_str: str) -> list[str]:
+        """Fetch listing pages via the Sprig endpoint. Returns HTML in page order."""
+        res = page.evaluate(
+            self._FETCH_PAGES_JS, {"pages": pages, "from": from_str, "to": to_str}
+        )
+        if res.get("error"):
+            raise RuntimeError(
+                f"visitoslo listing component not found ({res['error']}). "
+                "The site structure may have changed again."
+            )
+        out = []
+        for r in sorted(res["results"], key=lambda r: r["page"]):
+            if r["status"] != 200:
+                raise RuntimeError(
+                    f"visitoslo page {r['page']} returned HTTP {r['status']}"
+                )
+            out.append(r["html"])
+        return out
 
-        # Find and click the pagination anchor whose data-hx-vals references page=N.
-        # Using htmx.trigger ensures the swap happens (a bare click bubbles through
-        # the parent's hx-trigger="refresh" without hitting the intended handler).
-        script = (
-            "() => {"
-            "  const marker = '\"page\":\"' + %d + '\"';"
-            "  const a = Array.from(document.querySelectorAll('a[data-hx-vals]'))"
-            "    .find(el => (el.getAttribute('data-hx-vals')||'').includes(marker));"
-            "  if (!a) return 'not-found';"
-            "  if (typeof htmx !== 'undefined' && htmx.trigger) {"
-            "    htmx.trigger(a, 'click');"
-            "    return 'triggered';"
-            "  }"
-            "  a.click();"
-            "  return 'clicked';"
-            "}"
-        ) % target_page
-        result = page.evaluate(script)
-        if result == "not-found":
-            return False
-
-        # Wait for the swap: the first card's title changes.
-        for _ in range(20):
-            page.wait_for_timeout(300)
-            now_title = self._first_card_title(page)
-            if now_title and now_title != before:
-                page.wait_for_timeout(500)  # settle
-                return True
-        return False
+    @staticmethod
+    def _parse_total(html: str) -> Optional[int]:
+        """Read N from 'Showing 1–12 of N events'."""
+        m = re.search(r"of\s+([\d\s,.]+?)\s+events", html)
+        if not m:
+            return None
+        digits = re.sub(r"\D", "", m.group(1))
+        return int(digits) if digits else None
 
     def _parse_month_day(self, day_str: str, month_str: str) -> Optional[datetime]:
         """Turn '17' + 'aug' into a datetime, guessing the year."""
@@ -515,6 +528,10 @@ class VisitOsloScraper(BaseScraper):
         if not td_date:
             td_date = (today + timedelta(days=30)).date()
 
+        # The Sprig endpoint filters by date server-side (dd.mm.yyyy, inclusive).
+        from_str = (fd_date or today.date()).strftime("%d.%m.%Y")
+        to_str = td_date.strftime("%d.%m.%Y")
+
         # Cloudflare blocks the paginated Sprig XHR from headless browsers,
         # so this scraper runs headed for the whole session.
         pw, browser, ctx = self._create_browser(headless=False)
@@ -524,35 +541,33 @@ class VisitOsloScraper(BaseScraper):
         try:
             page = self._new_page(ctx)
             self._load_first_page(page)
+            # Fail fast with a clear message if Cloudflare didn't let us through
+            self._parse_page(page.content())
 
-            passed_end_date = False
-            current_page = 1
-            for _ in range(self.MAX_PAGES):
-                page_events = self._parse_page(page.content())
-                if not page_events:
-                    break
+            first_html = self._fetch_listing_pages(page, [1], from_str, to_str)[0]
+            total = self._parse_total(first_html) or 0
+            last_page = min(-(-total // self.PAGE_SIZE), self.MAX_PAGES)
 
-                for ev in page_events:
+            htmls = [first_html]
+            remaining = list(range(2, last_page + 1))
+            for i in range(0, len(remaining), self.FETCH_CONCURRENCY):
+                htmls += self._fetch_listing_pages(
+                    page, remaining[i : i + self.FETCH_CONCURRENCY], from_str, to_str
+                )
+
+            for html in htmls:
+                # Each page is one card per event occurrence (multi-day events
+                # repeat per day); keep the first occurrence in range.
+                for ev in self._parse_page("<title></title>" + html):
                     key = ev.url or ev.title.lower().strip()
                     if key in seen_keys:
                         continue
-                    seen_keys.add(key)
-
                     if ev.date:
                         d = ev.date.date()
-                        if fd_date and d < fd_date:
+                        if (fd_date and d < fd_date) or d > td_date:
                             continue
-                        if td_date and d > td_date:
-                            passed_end_date = True
-                            continue
+                    seen_keys.add(key)
                     events.append(ev)
-
-                if passed_end_date:
-                    break
-
-                current_page += 1
-                if not self._click_next_page(page, current_page):
-                    break
 
             # Best-effort detail enrichment (description only)
             for ev in events[: self.MAX_DETAIL_ENRICH]:
